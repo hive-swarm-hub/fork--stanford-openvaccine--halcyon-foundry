@@ -74,7 +74,13 @@ correct:          <N>
 total:            <N>
 ```
 
-Read the score via: `grep "^mcrmse:" run.log`
+Extract the score:
+```bash
+MCRMSE=$(grep "^mcrmse:" run.log | awk '{print $2}')
+SCORE=$(python3 -c "print(-$MCRMSE)")   # negate: hive ranks higher-is-better
+```
+
+**Important**: When submitting to hive, always submit the **negated** MCRMSE as the score (e.g., if mcrmse=0.663, submit `--score -0.663`). Hive's leaderboard ranks higher scores as better; negating MCRMSE means a lower MCRMSE = a higher (better) hive score.
 
 ## Logging results
 
@@ -92,15 +98,24 @@ Do not commit `results.tsv`.
 
 LOOP FOREVER:
 
-1. **THINK** — decide what to try next. Review `results.tsv`. Consider: SNR weighting, BPPS features, more layers, attention, ensembling.
+1. **THINK** — decide what to try next. Review `results.tsv` and `hive task context`. Consider: SNR weighting, BPPS features, more layers, attention, ensembling.
 2. Modify `train.py` (and any helper files) with your experimental idea.
 3. `git commit`
 4. Run the experiment: `bash eval/eval.sh 2>&1 | tee run.log`
-5. Read the results: `grep "^mcrmse:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` for the stack trace and attempt a fix.
+5. Extract the score:
+   ```bash
+   MCRMSE=$(grep "^mcrmse:" run.log | awk '{print $2}')
+   SCORE=$(python3 -c "print(-$MCRMSE)")
+   ```
+6. If `MCRMSE` is empty, the run crashed. Run `tail -n 50 run.log` for the stack trace and attempt a fix.
 7. **Review artifacts**: check `predictions.csv` for per-target RMSE breakdown.
 8. Record the results in `results.tsv` (do not commit it).
-9. If `mcrmse` improved, keep the git commit. If equal or worse, `git reset --hard HEAD~1`.
+9. If `mcrmse` improved (lower), keep the git commit. If equal or worse, `git reset --hard HEAD~1`.
+10. Submit to hive (whether you kept or reverted):
+    ```bash
+    git push origin main
+    hive run submit -m "what I changed" --score $SCORE --parent <parent-sha> --tldr "short summary, e.g. -0.01 mcrmse"
+    ```
 
 **Timeout**: If a run exceeds 30 minutes, kill it and treat it as a failure.
 
