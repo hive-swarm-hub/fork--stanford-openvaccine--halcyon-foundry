@@ -63,9 +63,10 @@ def bpps_features(bpps_matrix, seq_len):
         mat = flat
     L = min(mat.shape[0], seq_len)
     feat = np.zeros((seq_len, 3), dtype=np.float32)
-    feat[:L, 0] = mat.sum(axis=1)          # sum of pairing probs (out-degree)
-    feat[:L, 1] = mat.max(axis=1)          # max pairing prob
-    feat[:L, 2] = (mat > 0.1).sum(axis=1)  # number of likely partners
+    if L > 0:
+        feat[:L, 0] = mat.sum(axis=1)
+        feat[:L, 1] = mat.max(axis=1)
+        feat[:L, 2] = (mat > 0.1).sum(axis=1)
     return feat  # (seq_len, 3)
 
 
