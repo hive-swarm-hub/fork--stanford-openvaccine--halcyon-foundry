@@ -4,7 +4,7 @@ OpenVaccine mRNA Degradation Predictor
 Agents: modify this file to improve the MCRMSE score.
 Do NOT modify eval/ or prepare.sh.
 
-Experiment: BPPS graph convolution + SNR-weighted loss + early stopping
+Experiment: Ensemble of 3 GRU-graph-conv models (seeds 42, 123, 456), averaged predictions
 """
 
 import json
@@ -17,6 +17,7 @@ import random
 
 # ======================= CONFIG =======================
 SEED = 42          # keep in sync with eval/score.py
+SEEDS = [42, 123, 456]  # ensemble over multiple seeds
 VAL_SPLIT = 0.2    # keep in sync with eval/score.py
 BATCH_SIZE = 32
 EPOCHS = 100
@@ -156,21 +157,9 @@ def mcrmse(preds, labels):
     return torch.sqrt(((preds[:, :, scored_idx] - labels[:, :, scored_idx]) ** 2).mean(dim=(0, 1))).mean().item()
 
 
-def main():
-    set_seed(SEED)
-    print(f"Device: {DEVICE}")
-
-    all_data = load_json("data/train.json")
-
-    np.random.seed(SEED)
-    idx = np.random.permutation(len(all_data))
-    val_size = int(len(all_data) * VAL_SPLIT)
-    val_idx = set(idx[:val_size].tolist())
-    train_split = [d for i, d in enumerate(all_data) if i not in val_idx]
-    val_split   = [d for i, d in enumerate(all_data) if i in val_idx]
-
-    print(f"Train: {len(train_split)} | Val: {len(val_split)}")
-
+def train_one_model(seed, train_split, val_split):
+    """Train one GRUGraphModel with the given seed; return (best_score, val_loader, model)."""
+    set_seed(seed)
     train_loader = DataLoader(RNADataset(train_split), batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
     val_loader   = DataLoader(RNADataset(val_split),   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
@@ -211,34 +200,80 @@ def main():
         if val_score < best_score:
             best_score = val_score
             no_improve = 0
-            torch.save(model.state_dict(), "best_model.pt")
+            torch.save(model.state_dict(), f"best_model_seed{seed}.pt")
         else:
             no_improve += 1
 
         if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{EPOCHS} | loss: {train_loss/len(train_loader):.4f} | val MCRMSE: {val_score:.4f} | best: {best_score:.4f}")
+            print(f"  [seed={seed}] Epoch {epoch:3d}/{EPOCHS} | loss: {train_loss/len(train_loader):.4f} | val MCRMSE: {val_score:.4f} | best: {best_score:.4f}")
 
         if no_improve >= PATIENCE:
-            print(f"Early stopping at epoch {epoch}")
+            print(f"  [seed={seed}] Early stopping at epoch {epoch}")
             break
 
-    # Save predictions with best model
-    model.load_state_dict(torch.load("best_model.pt", map_location=DEVICE))
-    model.eval()
+    model.load_state_dict(torch.load(f"best_model_seed{seed}.pt", map_location=DEVICE))
+    return best_score, val_loader, model
+
+
+def main():
+    print(f"Device: {DEVICE}")
+
+    all_data = load_json("data/train.json")
+
+    # Fixed train/val split — must match eval/score.py (uses SEED=42)
+    np.random.seed(SEED)
+    idx = np.random.permutation(len(all_data))
+    val_size = int(len(all_data) * VAL_SPLIT)
+    val_idx = set(idx[:val_size].tolist())
+    train_split = [d for i, d in enumerate(all_data) if i not in val_idx]
+    val_split   = [d for i, d in enumerate(all_data) if i in val_idx]
+
+    print(f"Train: {len(train_split)} | Val: {len(val_split)}")
+
+    # Train ensemble
+    ensemble_preds = None  # will accumulate (N_val_rows, n_targets) arrays keyed by id_seqpos
+    all_rows_by_id = {}
+
+    for seed in SEEDS:
+        print(f"\n=== Training model seed={seed} ===")
+        best_score, val_loader, model = train_one_model(seed, train_split, val_split)
+        print(f"  Seed {seed} best MCRMSE: {best_score:.4f}")
+
+        model.eval()
+        with torch.no_grad():
+            for seq, struct, loop, bpps, _, _, ids in val_loader:
+                seq, struct, loop, bpps = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), bpps.to(DEVICE)
+                preds = model(seq, struct, loop, bpps)[:, :SEQ_SCORED, :].cpu().numpy()
+                for b, sid in enumerate(ids):
+                    for pos in range(SEQ_SCORED):
+                        key = f"{sid}_{pos}"
+                        if key not in all_rows_by_id:
+                            all_rows_by_id[key] = np.zeros(len(TARGETS), dtype=np.float32)
+                        all_rows_by_id[key] += preds[b, pos] / len(SEEDS)
+
+    # Build averaged predictions
     rows = []
-    with torch.no_grad():
-        for seq, struct, loop, bpps, _, _, ids in val_loader:
-            seq, struct, loop, bpps = seq.to(DEVICE), struct.to(DEVICE), loop.to(DEVICE), bpps.to(DEVICE)
-            preds = model(seq, struct, loop, bpps)[:, :SEQ_SCORED, :].cpu().numpy()
-            for b, sid in enumerate(ids):
-                for pos in range(SEQ_SCORED):
-                    row = {"id_seqpos": f"{sid}_{pos}"}
-                    row.update({t: float(preds[b, pos, k]) for k, t in enumerate(TARGETS)})
-                    rows.append(row)
+    for key, avg_pred in all_rows_by_id.items():
+        row = {"id_seqpos": key}
+        row.update({t: float(avg_pred[k]) for k, t in enumerate(TARGETS)})
+        rows.append(row)
 
     pd.DataFrame(rows).to_csv("predictions.csv", index=False)
-    print(f"\nBest val MCRMSE: {best_score:.4f}")
-    print("Saved predictions.csv")
+    print("\nSaved ensemble predictions.csv")
+
+    # Quick ensemble MCRMSE estimate using last model's val_loader
+    # (the val split is the same for all seeds, so any loader works)
+    val_loader_ref = DataLoader(RNADataset(val_split), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    scored_idx = [TARGETS.index(t) for t in SCORED_TARGETS]
+    ensemble_preds_list, all_labels = [], []
+    for seq, struct, loop, bpps, labels, _, ids in val_loader_ref:
+        batch_preds = np.stack([all_rows_by_id[f"{sid}_{pos}"]
+                                for sid in ids
+                                for pos in range(SEQ_SCORED)]).reshape(len(ids), SEQ_SCORED, len(TARGETS))
+        ensemble_preds_list.append(torch.tensor(batch_preds))
+        all_labels.append(labels)
+    ens_score = mcrmse(torch.cat(ensemble_preds_list), torch.cat(all_labels))
+    print(f"\nEnsemble val MCRMSE: {ens_score:.4f}")
 
 
 if __name__ == "__main__":
