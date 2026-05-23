@@ -54,10 +54,14 @@ def load_json(path):
 
 def bpps_features(bpps_matrix, seq_len):
     """Aggregate the L×L BPPS matrix into per-position features."""
-    mat = np.array(bpps_matrix, dtype=np.float32)  # (L, L)
-    # Clamp to actual seq_len in case of size mismatch
+    flat = np.array(bpps_matrix, dtype=np.float32)
+    if flat.ndim == 1:
+        # Stored as flattened row-major; infer L from length
+        L_inferred = int(round(len(flat) ** 0.5))
+        mat = flat.reshape(L_inferred, L_inferred) if L_inferred * L_inferred == len(flat) else np.zeros((seq_len, seq_len), dtype=np.float32)
+    else:
+        mat = flat
     L = min(mat.shape[0], seq_len)
-    mat = mat[:L, :L]
     feat = np.zeros((seq_len, 3), dtype=np.float32)
     feat[:L, 0] = mat.sum(axis=1)          # sum of pairing probs (out-degree)
     feat[:L, 1] = mat.max(axis=1)          # max pairing prob
